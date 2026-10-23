@@ -4,6 +4,8 @@
 
 `rdr` is a zero-bloat, keyboard-first terminal workspace designed for running, monitoring, and multiplexing AI coding agents across independent projects with real-time Writing/Sleeping telemetry in the status footer.
 
+![rdr screenshot preview](./docs/screenshots/cockpit.png)
+
 ## What makes rdr special?
 
 - **One terminal session** hosts multiple AI agents (agy, claude, opencode, aider) in a tmux layout
@@ -66,6 +68,18 @@ rdr -k           # kill session
 | quad | 4 | Four panes in grid |
 | rows | 5 | Five panes in rows |
 | telemetry | 5 | Telemetry cockpit with proxy logs, tool-tracker, stats, and control shell |
+
+## Screenshots
+
+![Cockpit overview](./docs/screenshots/cockpit.png)
+![Quad layout](./docs/screenshots/quad.png)
+![Telemetry view](./docs/screenshots/telemetry.png)
+
+*Placeholder screenshots — replace with actual terminal captures.
+
+## Optional Integration with Laya
+
+`rdr` can optionally integrate with the `laya` secret gateway for proxy health checks (`laya-tool-tracker`, `laya-stats --routing`, `laya-stats --audit`). This is NOT required — `rdr` runs standalone with any agent that has a CLI.
 
 ## License
 
