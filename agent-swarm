@@ -1,0 +1,1252 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# agent-swarm: Keyboard-First Agent Workspace by johngf (rdr)
+# Parallel agent multiplexing with real-time Writing/Sleeping telemetry.
+# Zero host bloat: Built on standard tmux and Alacritty.
+# ==============================================================================
+
+set -euo pipefail
+
+SESSION_NAME="agent-swarm"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+TOOL_TRACKER="$(dirname "$SCRIPT_PATH")/laya-tool-tracker"
+DEFAULT_PROJ="$PWD"
+DEFAULT_LAYOUT="${AGENT_SWARM_LAYOUT:-quad}"
+DEFAULT_TERM="${AGENT_SWARM_TERM:-alacritty}"
+DEFAULT_MODE="${AGENT_SWARM_MODE:-maximized}"
+DEFAULT_SHELL="${AGENT_SWARM_SHELL:-/usr/bin/fish}"
+AGENT_SHELL="${AGENT_SWARM_AGENT_SHELL:-/usr/bin/fish}"
+
+KEYSHEET="${DOTFILES_DIR:-$HOME/dotfiles}/config/agents/agent-swarm-keys.txt"
+# Static, non-paging popup renderer (avoids popups that self-close instantly).
+KEYS_VIEWER="$(dirname "$SCRIPT_PATH")/agent-swarm-keys"
+
+# Print the compact cheat sheet (falls back to the long --help text if missing)
+show_keys() {
+  if [[ -f "$KEYSHEET" ]]; then
+    if command -v bat >/dev/null 2>&1; then
+      bat --plain --paging=never --style=plain "$KEYSHEET"
+    else
+      cat "$KEYSHEET"
+    fi
+  else
+    show_help
+  fi
+}
+
+show_help() {
+  cat <<EOF
+Usage: agent-swarm [command|options] [project_dir1] [project_dir2] ...
+Alias: rdr
+
+Default Windows:
+  Window 0: telemetry   5-pane cockpit (proxy logs, tool tracker, routing stats, audit stats, fish shell)
+  Window 1: agents      4-shell quad grid in FISH for AI coding agents (agy, oc, ai)
+  Window 2: editor      Single full-screen shell in FISH for nvim or user commands
+
+Commands:
+  add <dir> [layout]    Dynamically add a project folder (layout: single, dual, tri, quad)
+  layout <preset>       Change layout of active window (single, dual, tri, quad, rows, reset, zoom)
+  clear, -clear, -c     Reset and clear all panes to clean default shells (preserves layout)
+  restart, -r           Rebuild swarm session from scratch (kills and restarts)
+  notif [on|off]        Toggle or set desktop notifications on/off
+  idle-count            Print count of idle/sleeping shells across all windows
+  attach, -a            Attach to existing swarm session
+  kill, -k              Terminate the active swarm session
+  help, -h              Show this help message
+
+Terminal & Window Options:
+  --alacritty           Launch in dedicated Alacritty window (default)
+  --konsole             Launch in dedicated Konsole window
+  --maximized           Launch window maximized (default)
+  --fullscreen          Launch window in full-screen mode
+  --floating            Launch window in standard floating dimensions
+  -t, --terminal        Run directly inside current terminal (skip GUI launcher)
+
+Layout Presets for Project Windows:
+  --single, -1          Single full-screen shell (default)
+  --dual, -2            Dual columns (50/50 side-by-side)
+  --tri, -3             Tri-pane (60% Left Agent, 40% Right top/bottom clean shells)
+  --quad, -4            4 equal shells in a 2x2 grid
+  -l, --layout <name>   Set default layout (single, dual, tri, quad)
+
+Keyboard Navigation Shortcuts inside Swarm:
+  Alt + 0..9            Jump directly to window 0..9 (no prefix needed)
+  Shift + Left/Right    Move between panes; at window edge wraps to prev/next window
+  Shift + Up/Down       Move between top and bottom panes
+  Alt + backtick        Cycle forward through panes
+  Alt + = or Alt + r    Reset/equalize pane dimensions (fixes mouse deformation)
+  Alt + l               Cycle layout: 1 Shell -> Dual -> Tri -> Quad -> 1 Shell
+  Alt + z               Zoom / full-screen active pane (toggle)
+  Ctrl+b h              Cheat-sheet popup with all shortcuts (also: agent-swarm help, Ctrl+b h)
+  Alt + n               Toggle desktop notifications ON / MUTED
+  Ctrl + b a            Prompt to add a new project folder to active swarm
+  Ctrl + b =            Reset/equalize pane dimensions (under prefix)
+  Ctrl + b % or |       Split pane vertically (preserves active directory)
+  Ctrl + b " or -       Split pane horizontally (preserves active directory)
+  Ctrl + b x            Close ACTIVE PANE only (last pane in window closes window)
+  Ctrl + b c            New empty window tab (plain shell, no layout)
+  Ctrl + b ,            Rename current window
+  Ctrl + b &            Close current WINDOW (prompts y/n)
+  Ctrl + b w            Window list / picker
+  Ctrl + b o            Jump to next pane
+  Ctrl + b Space        Cycle through tmux pane layouts
+  Ctrl + b d            Detach from session (leaves agents running in background)
+  Mouse                 Click to select panes, scroll to view history
+EOF
+}
+
+# ==============================================================================
+# Preflight dependency check.
+# Without this guard a missing binary aborts the script under `set -e` with
+# exit 127; in GUI mode the Alacritty window is created, the child dies
+# instantly and the window flashes closed with no diagnostic at all.
+# ==============================================================================
+preflight_check() {
+  local term_app="${1:-$DEFAULT_TERM}"
+  local -a miss_name=() miss_desc=() miss_fix=()
+
+  _miss_add() {
+    miss_name+=("$1")
+    miss_desc+=("$2")
+    miss_fix+=("$3")
+  }
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    _miss_add "tmux" "terminal multiplexer (required backend)" "sudo pacman -S tmux"
+  fi
+
+  case "$term_app" in
+  konsole)
+    command -v konsole >/dev/null 2>&1 ||
+      _miss_add "konsole" "terminal emulator" "sudo pacman -S konsole"
+    ;;
+  alacritty | *)
+    command -v alacritty >/dev/null 2>&1 ||
+      _miss_add "alacritty" "terminal emulator" "sudo pacman -S alacritty"
+    ;;
+  esac
+
+  if [[ ! -x "$DEFAULT_SHELL" ]]; then
+    _miss_add "${DEFAULT_SHELL##*/}" "shell used for all swarm panes" "sudo pacman -S fish"
+  fi
+  if [[ ! -x "$AGENT_SHELL" ]]; then
+    _miss_add "${AGENT_SHELL##*/}" "shell used for the agent panes" "sudo pacman -S fish"
+  fi
+
+  if [[ ${#miss_name[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  local report="agent-swarm: missing required dependencies:"$'\n'
+  local i
+  for ((i = 0; i < ${#miss_name[@]}; i++)); do
+    report+="  - ${miss_name[$i]} (${miss_desc[$i]})"$'\n'
+    report+="      fix: ${miss_fix[$i]}"$'\n'
+  done
+  report+="Install the packages above, then relaunch agent-swarm."
+
+  printf "%s\n" "$report" >&2
+
+  # Surface the failure on-screen too, but only when stderr is not a
+  # terminal: that means the launcher came from KRunner / a .desktop file,
+  # where the message above would be written to an invisible void.
+  if [[ ! -t 2 ]]; then
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send -u critical -t "Agent Swarm" "Missing dependency: ${miss_name[0]}" >/dev/null 2>&1 || true
+    fi
+    if command -v kdialog >/dev/null 2>&1; then
+      # Detach so the dialog never blocks the caller.
+      setsid kdialog --title "Agent Swarm - missing dependencies" --error "$report" \
+        >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+    fi
+  fi
+
+  exit 1
+}
+
+# Agent metrics: counts total running agents, busy agents, and finished agents in Window 1
+get_agent_metrics() {
+  local total=0
+  local busy=0
+  local finished=0
+  local cmd status wm_status
+  local _SWARM_SCOPE
+  _SWARM_SCOPE=$(tmux show-option -t "$SESSION_NAME" -v @swarm_finish_scope 2>/dev/null || true)
+  _SWARM_SCOPE="${_SWARM_SCOPE:-multi}"
+
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "0 0 0"
+    return
+  fi
+
+  while read -r cmd status wm_status; do
+    case "$cmd" in
+    fish | bash | zsh | sh | "") continue ;;
+    esac
+    total=$((total + 1))
+    if [[ "$status" == "working" || "$wm_status" == "working" ]]; then
+      busy=$((busy + 1))
+    else
+      finished=$((finished + 1))
+    fi
+  done < <(
+    if [[ "$_SWARM_SCOPE" == "agents-only" ]]; then
+      win_tracked=$(tmux show-option -t "$SESSION_NAME:1" -v @swarm_tracked 2>/dev/null || echo "on")
+      if [[ "$win_tracked" == "on" ]]; then
+        tmux list-panes -t "$SESSION_NAME:1" -F "#{pane_current_command} #{@agent_status} #{@workmux_pane_status}" 2>/dev/null || true
+      fi
+    else
+      for win_idx in $(tmux list-windows -t "$SESSION_NAME" -F '#{window_index}' 2>/dev/null | awk '$1 != 0'); do
+        win_tracked=$(tmux show-option -t "$SESSION_NAME:$win_idx" -v @swarm_tracked 2>/dev/null || echo "on")
+        [[ "$win_tracked" == "on" ]] || continue
+        tmux list-panes -t "$SESSION_NAME:$win_idx" -F "#{pane_current_command} #{@agent_status} #{@workmux_pane_status}" 2>/dev/null || true
+      done
+    fi
+  )
+
+  echo "$total $busy $finished"
+}
+
+# Footer status: shows Finished counts
+get_idle_shells_count() {
+  local metrics total busy finished
+  metrics=($(get_agent_metrics))
+  total="${metrics[0]}"
+  busy="${metrics[1]}"
+  finished="${metrics[2]}"
+
+  if [[ $total -eq 0 ]]; then
+    echo -n "#[fg=#6C7A96]Standby#[default]"
+    return
+  fi
+
+  echo -n "#[bold,fg=#A3BE8C]Finished: $finished/$total#[default]"
+}
+
+# Raw counts for external status bars (e.g. KDE panel/tray)
+get_writing_count() {
+  local metrics
+  metrics=($(get_agent_metrics))
+  echo "${metrics[1]}"
+}
+
+get_finished_count() {
+  local metrics
+  metrics=($(get_agent_metrics))
+  echo "${metrics[2]}"
+}
+
+# Plain-text window title for KDE panel / taskbar
+get_window_title() {
+  local metrics total busy finished
+  metrics=($(get_agent_metrics))
+  total="${metrics[0]}"
+  busy="${metrics[1]}"
+  finished="${metrics[2]}"
+
+  if [[ $total -eq 0 ]]; then
+    echo -n "Agent Swarm"
+    return
+  fi
+
+  echo -n "[Finished: $finished/$total] Agent Swarm"
+}
+
+# Synchronize notification badge counter to KDE Plasma taskbar
+sync_taskbar_badge() {
+  local count="${1:-0}"
+  if command -v gdbus >/dev/null 2>&1; then
+    local visible="false"
+    if [[ $count -gt 0 ]]; then
+      visible="true"
+    fi
+    local payload="{'count': <@x ${count}>, 'count-visible': <${visible}>}"
+    gdbus emit --session \
+      --object-path /com/canonical/unity/launcherentry/agent_swarm \
+      --signal com.canonical.Unity.LauncherEntry.Update \
+      "application://agent-swarm.desktop" \
+      "$payload" 2>/dev/null || true
+    gdbus emit --session \
+      --object-path /com/canonical/unity/launcherentry/agent_swarm \
+      --signal com.canonical.Unity.LauncherEntry.Update \
+      "application://Alacritty.desktop" \
+      "$payload" 2>/dev/null || true
+  fi
+}
+
+# Synchronize window title and taskbar badge directly
+sync_window_title() {
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    local metrics total busy finished
+    metrics=($(get_agent_metrics))
+    total="${metrics[0]}"
+    busy="${metrics[1]}"
+    finished="${metrics[2]}"
+
+    local title
+    if [[ $total -eq 0 ]]; then
+      title="Agent Swarm"
+    else
+      title="[Finished: $finished/$total] Agent Swarm"
+    fi
+
+    tmux set-option -t "$SESSION_NAME" set-titles-string "$title" 2>/dev/null || true
+    tmux refresh-client 2>/dev/null || true
+
+    sync_taskbar_badge "$finished"
+  fi
+}
+
+# Apply layout to active window
+apply_layout() {
+  local preset="${1:-single}"
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "Swarm session '$SESSION_NAME' is not active."
+    exit 1
+  fi
+
+  local win_id
+  win_id=$(tmux display-message -t "$SESSION_NAME" -p "#{window_id}")
+
+  case "$preset" in
+  cycle | next)
+    local current_layout
+    current_layout=$(tmux show-options -t "$win_id" -w -v @swarm_layout 2>/dev/null || echo "")
+    local is_zoomed
+    is_zoomed=$(tmux display-message -t "$win_id" -p "#{window_zoomed_flag}")
+
+    if [[ "$is_zoomed" == "1" ]]; then
+      current_layout="single"
+    elif [[ -z "$current_layout" ]]; then
+      current_layout="single"
+    fi
+
+    local next_layout="single"
+    case "$current_layout" in
+    single) next_layout="dual" ;;
+    dual) next_layout="tri" ;;
+    tri) next_layout="quad" ;;
+    quad | *) next_layout="single" ;;
+    esac
+    apply_layout "$next_layout"
+    return
+    ;;
+  single | 1 | full)
+    local is_zoomed
+    is_zoomed=$(tmux display-message -t "$win_id" -p "#{window_zoomed_flag}")
+    if [[ "$is_zoomed" != "1" ]]; then
+      tmux resize-pane -t "$win_id" -Z
+    fi
+    tmux set-option -t "$win_id" -w @swarm_layout "single"
+    tmux display-message -t "$SESSION_NAME" "Layout: 1 Shell (Single) [Alt+l to cycle]" 2>/dev/null || true
+    ;;
+  quad | 4 | grid)
+    local is_zoomed
+    is_zoomed=$(tmux display-message -t "$win_id" -p "#{window_zoomed_flag}")
+    if [[ "$is_zoomed" == "1" ]]; then
+      tmux resize-pane -t "$win_id" -Z
+    fi
+    local count
+    count=$(tmux list-panes -t "$win_id" | wc -l)
+    while [[ $count -lt 4 ]]; do
+      tmux split-window -t "$win_id" -c "#{pane_current_path}"
+      count=$((count + 1))
+    done
+    tmux select-layout -t "$win_id" tiled
+    tmux set-option -t "$win_id" -w @swarm_layout "quad"
+    tmux display-message -t "$SESSION_NAME" "Layout: 4-Shell Quad Grid [Alt+l to cycle]" 2>/dev/null || true
+    ;;
+  tri | 3 | master)
+    local is_zoomed
+    is_zoomed=$(tmux display-message -t "$win_id" -p "#{window_zoomed_flag}")
+    if [[ "$is_zoomed" == "1" ]]; then
+      tmux resize-pane -t "$win_id" -Z
+    fi
+    local count
+    count=$(tmux list-panes -t "$win_id" | wc -l)
+    while [[ $count -lt 3 ]]; do
+      tmux split-window -t "$win_id" -c "#{pane_current_path}"
+      count=$((count + 1))
+    done
+    tmux select-layout -t "$win_id" main-vertical
+    tmux set-option -t "$win_id" -w @swarm_layout "tri"
+    tmux display-message -t "$SESSION_NAME" "Layout: Tri-Pane Master-Stack [Alt+l to cycle]" 2>/dev/null || true
+    ;;
+  dual | 2 | split)
+    local is_zoomed
+    is_zoomed=$(tmux display-message -t "$win_id" -p "#{window_zoomed_flag}")
+    if [[ "$is_zoomed" == "1" ]]; then
+      tmux resize-pane -t "$win_id" -Z
+    fi
+    local count
+    count=$(tmux list-panes -t "$win_id" | wc -l)
+    if [[ $count -lt 2 ]]; then
+      tmux split-window -h -t "$win_id" -c "#{pane_current_path}"
+    fi
+    tmux select-layout -t "$win_id" even-horizontal
+    tmux set-option -t "$win_id" -w @swarm_layout "dual"
+    tmux display-message -t "$SESSION_NAME" "Layout: Dual Columns [Alt+l to cycle]" 2>/dev/null || true
+    ;;
+  rows | horizontal)
+    local is_zoomed
+    is_zoomed=$(tmux display-message -t "$win_id" -p "#{window_zoomed_flag}")
+    if [[ "$is_zoomed" == "1" ]]; then
+      tmux resize-pane -t "$win_id" -Z
+    fi
+    tmux select-layout -t "$win_id" even-vertical
+    tmux set-option -t "$win_id" -w @swarm_layout "rows"
+    tmux display-message -t "$SESSION_NAME" "Layout: Equal Rows [Alt+l to cycle]" 2>/dev/null || true
+    ;;
+  reset | balance | equal | dimensions | normalize)
+    local is_zoomed
+    is_zoomed=$(tmux display-message -t "$win_id" -p "#{window_zoomed_flag}" 2>/dev/null || echo "0")
+    if [[ "$is_zoomed" == "1" ]]; then
+      tmux resize-pane -t "$win_id" -Z
+    fi
+
+    local current_layout
+    current_layout=$(tmux show-options -t "$win_id" -w -v @swarm_layout 2>/dev/null || echo "")
+    local saved_layout
+    saved_layout=$(tmux show-options -t "$win_id" -w -v @swarm_saved_layout 2>/dev/null || echo "")
+    local pane_count
+    pane_count=$(tmux list-panes -t "$win_id" 2>/dev/null | wc -l)
+    local win_name
+    win_name=$(tmux display-message -t "$win_id" -p "#{window_name}" 2>/dev/null || echo "")
+
+    if [[ "$win_name" == "telemetry" || "$current_layout" == "telemetry" ]]; then
+      if [[ -n "$saved_layout" ]]; then
+        tmux select-layout -t "$win_id" "$saved_layout" 2>/dev/null || true
+      fi
+      tmux display-message -t "$SESSION_NAME" "Telemetry Cockpit Dimensions Restored" 2>/dev/null || true
+      return
+    fi
+
+    case "$current_layout" in
+    quad)
+      tmux select-layout -t "$win_id" tiled
+      tmux display-message -t "$SESSION_NAME" "Panes Restored: Quad (2x2 Grid) [Alt+= / Alt+r]" 2>/dev/null || true
+      ;;
+    dual)
+      tmux select-layout -t "$win_id" even-horizontal
+      tmux display-message -t "$SESSION_NAME" "Panes Restored: Dual (50/50 Columns) [Alt+= / Alt+r]" 2>/dev/null || true
+      ;;
+    tri)
+      tmux select-layout -t "$win_id" main-vertical
+      tmux display-message -t "$SESSION_NAME" "Panes Restored: Tri-Pane (Master-Stack) [Alt+= / Alt+r]" 2>/dev/null || true
+      ;;
+    rows)
+      tmux select-layout -t "$win_id" even-vertical
+      tmux display-message -t "$SESSION_NAME" "Panes Restored: Equal Rows [Alt+= / Alt+r]" 2>/dev/null || true
+      ;;
+    single)
+      if [[ $pane_count -gt 1 ]]; then
+        tmux resize-pane -t "$win_id" -Z
+      fi
+      tmux display-message -t "$SESSION_NAME" "Panes Restored: Single Shell [Alt+= / Alt+r]" 2>/dev/null || true
+      ;;
+    *)
+      if [[ $pane_count -eq 4 ]]; then
+        tmux select-layout -t "$win_id" tiled
+        tmux set-option -t "$win_id" -w @swarm_layout "quad"
+        tmux display-message -t "$SESSION_NAME" "Panes Restored: Quad (2x2 Grid) [Alt+= / Alt+r]" 2>/dev/null || true
+      elif [[ $pane_count -eq 2 ]]; then
+        tmux select-layout -t "$win_id" even-horizontal
+        tmux set-option -t "$win_id" -w @swarm_layout "dual"
+        tmux display-message -t "$SESSION_NAME" "Panes Restored: Dual (50/50 Columns) [Alt+= / Alt+r]" 2>/dev/null || true
+      elif [[ $pane_count -eq 3 ]]; then
+        tmux select-layout -t "$win_id" main-vertical
+        tmux set-option -t "$win_id" -w @swarm_layout "tri"
+        tmux display-message -t "$SESSION_NAME" "Panes Restored: Tri-Pane [Alt+= / Alt+r]" 2>/dev/null || true
+      else
+        tmux select-layout -t "$win_id" -E
+        tmux display-message -t "$SESSION_NAME" "Panes Equalized [Alt+= / Alt+r]" 2>/dev/null || true
+      fi
+      ;;
+    esac
+    ;;
+  zoom | toggle-zoom)
+    tmux resize-pane -t "$win_id" -Z
+    ;;
+  *)
+    echo "Unknown layout preset: $preset (choose: cycle, single, dual, tri, quad, rows, reset, zoom)"
+    exit 1
+    ;;
+  esac
+}
+
+create_project_window() {
+  local target_dir="$1"
+  local layout="${2:-$DEFAULT_LAYOUT}"
+  local win_name="${3:-$(basename "$target_dir")}"
+  local custom_shell="${4:-$DEFAULT_SHELL}"
+
+  local win_id
+  win_id=$(tmux new-window -P -F "#{window_id}" -t "$SESSION_NAME" -n "$win_name" -c "$target_dir" "$custom_shell")
+
+  case "$layout" in
+  quad | 4 | grid)
+    tmux split-window -h -t "$win_id" -c "$target_dir" "$custom_shell"
+    tmux split-window -v -t "${win_id}.0" -c "$target_dir" "$custom_shell"
+    tmux split-window -v -t "${win_id}.2" -c "$target_dir" "$custom_shell"
+    tmux select-layout -t "$win_id" tiled
+    sleep 0.3
+    for pid in $(tmux list-panes -t "$win_id" -F "#{pane_id}"); do
+      tmux send-keys -t "$pid" C-u "clear" C-m
+      tmux clear-history -t "$pid" 2>/dev/null || true
+    done
+    tmux select-pane -t "${win_id}.0" 2>/dev/null || true
+    tmux set-option -t "$win_id" -w @swarm_layout "quad"
+    ;;
+  tri | 3 | master)
+    tmux split-window -h -t "$win_id" -p 40 -c "$target_dir" "$custom_shell"
+    tmux split-window -v -t "${win_id}.1" -p 50 -c "$target_dir" "$custom_shell"
+    tmux select-layout -t "$win_id" main-vertical
+    sleep 0.3
+    for pid in $(tmux list-panes -t "$win_id" -F "#{pane_id}"); do
+      tmux send-keys -t "$pid" C-u "clear" C-m
+      tmux clear-history -t "$pid" 2>/dev/null || true
+    done
+    tmux select-pane -t "${win_id}.0" 2>/dev/null || true
+    tmux set-option -t "$win_id" -w @swarm_layout "tri"
+    ;;
+  dual | 2 | split)
+    tmux split-window -h -t "$win_id" -p 50 -c "$target_dir" "$custom_shell"
+    tmux select-layout -t "$win_id" even-horizontal
+    sleep 0.3
+    for pid in $(tmux list-panes -t "$win_id" -F "#{pane_id}"); do
+      tmux send-keys -t "$pid" C-u "clear" C-m
+      tmux clear-history -t "$pid" 2>/dev/null || true
+    done
+    tmux select-pane -t "${win_id}.0" 2>/dev/null || true
+    tmux set-option -t "$win_id" -w @swarm_layout "dual"
+    ;;
+  single | 1 | full | *)
+    sleep 0.2
+    for pid in $(tmux list-panes -t "$win_id" -F "#{pane_id}"); do
+      tmux send-keys -t "$pid" C-u "clear" C-m
+      tmux clear-history -t "$pid" 2>/dev/null || true
+    done
+    tmux select-pane -t "${win_id}.0" 2>/dev/null || true
+    tmux set-option -t "$win_id" -w @swarm_layout "single"
+    ;;
+  esac
+}
+
+setup_telemetry_window() {
+  if ! tmux list-windows -t "$SESSION_NAME" -F "#{window_index}" 2>/dev/null | grep -q "^0$"; then
+    tmux new-window -t "$SESSION_NAME:0" -n "telemetry" -c "$HOME" "$DEFAULT_SHELL" 2>/dev/null || true
+  fi
+
+  local win_id
+  win_id=$(tmux display-message -t "$SESSION_NAME:0" -p "#{window_id}" 2>/dev/null || true)
+  if [[ -z "$win_id" ]]; then
+    return
+  fi
+
+  local is_zoomed0
+  is_zoomed0=$(tmux display-message -t "$SESSION_NAME:0" -p "#{window_zoomed_flag}" 2>/dev/null || echo "0")
+  if [[ "$is_zoomed0" == "1" ]]; then
+    tmux resize-pane -t "$SESSION_NAME:0" -Z 2>/dev/null || true
+  fi
+
+  local pids
+  pids=($(tmux list-panes -t "$win_id" -F "#{pane_id}" 2>/dev/null || true))
+  if [[ ${#pids[@]} -ne 5 ]]; then
+    # Clean down to 1 pane and build the 5-pane layout cleanly
+    for pid in "${pids[@]:1}"; do
+      tmux kill-pane -t "$pid" 2>/dev/null || true
+    done
+
+    local p0="${pids[0]}"
+    tmux respawn-pane -k -t "$p0" "/usr/bin/fish -c 'echo (set_color yellow)\"[Laya Proxy Warnings & Errors Filter]\"(set_color normal); journalctl --user -u laya-proxy -f -n 100 --output=cat | grep --line-buffered -E \"WARN|ERROR|Safeguard|panic|timeout|hedging\"; exec fish'"
+
+    # Split Top-Right (Pane 1)
+    local p1
+    p1=$(tmux split-window -P -F "#{pane_id}" -h -t "$p0" -c "$HOME" "/usr/bin/fish -c 'python3 $TOOL_TRACKER; exec fish'")
+
+    # Split Bottom-Left 1 (Pane 2)
+    local p2
+    p2=$(tmux split-window -P -F "#{pane_id}" -v -t "$p0" -c "$HOME" "/usr/bin/fish -c 'watch -c -n 3 laya-stats --routing; exec fish'")
+
+    # Split Bottom-Right (Pane 4)
+    local p4
+    p4=$(tmux split-window -P -F "#{pane_id}" -v -t "$p1" -c "$HOME" "$DEFAULT_SHELL")
+
+    # Select tiled layout
+    tmux select-layout -t "$win_id" tiled
+
+    # Split Bottom-Left 2 (Pane 3) horizontally next to p2
+    local p3
+    p3=$(tmux split-window -P -F "#{pane_id}" -h -t "$p2" -c "$HOME" "/usr/bin/fish -c 'watch -c -n 3 laya-stats --audit; exec fish'")
+
+    local banner='clear; echo (set_color cyan)"[Laya Telemetry Control Shell (Fish)]"(set_color normal); echo (set_color yellow)"Commands:"(set_color normal) "laya-stats, laya-sync, laya-limits, rdr -c"'
+    tmux send-keys -t "$p4" "$banner" C-m
+  else
+    # Already 5 panes, respawn processes cleanly without timing race
+    tmux respawn-pane -k -t "${pids[0]}" "/usr/bin/fish -c 'echo (set_color yellow)\"[Laya Proxy Warnings & Errors Filter]\"(set_color normal); journalctl --user -u laya-proxy -f -n 100 --output=cat | grep --line-buffered -E \"WARN|ERROR|Safeguard|panic|timeout|hedging\"; exec fish'"
+    tmux respawn-pane -k -t "${pids[1]}" "/usr/bin/fish -c 'python3 $TOOL_TRACKER; exec fish'"
+    tmux respawn-pane -k -t "${pids[2]}" "/usr/bin/fish -c 'watch -c -n 3 laya-stats --routing; exec fish'"
+    tmux respawn-pane -k -t "${pids[3]}" "/usr/bin/fish -c 'watch -c -n 3 laya-stats --audit; exec fish'"
+    tmux respawn-pane -k -t "${pids[4]}" "$DEFAULT_SHELL"
+    local banner='clear; echo (set_color cyan)"[Laya Telemetry Control Shell (Fish)]"(set_color normal); echo (set_color yellow)"Commands:"(set_color normal) "laya-stats, laya-sync, laya-limits, rdr -c"'
+    tmux send-keys -t "${pids[4]}" "$banner" C-m
+  fi
+
+  local cur_telemetry_layout
+  cur_telemetry_layout=$(tmux display-message -t "$win_id" -p "#{window_layout}" 2>/dev/null || echo "")
+  if [[ -n "$cur_telemetry_layout" ]]; then
+    tmux set-option -t "$win_id" -w @swarm_saved_layout "$cur_telemetry_layout" 2>/dev/null || true
+  fi
+  tmux set-option -t "$win_id" -w @swarm_layout "telemetry" 2>/dev/null || true
+}
+
+# Clear/reset panes to clean default shell state without destroying session
+clear_swarm_panes() {
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    return 1
+  fi
+
+  echo "Resetting all swarm panes to clean default shell state..."
+
+  # Ensure Window 0 (telemetry) has 5 panes and running telemetry services
+  setup_telemetry_window
+
+  # Ensure Window 1 (agents) exists and has quad layout in FISH
+  if ! tmux list-windows -t "$SESSION_NAME" -F "#{window_index}" | grep -q "^1$"; then
+    create_project_window "$DEFAULT_PROJ" "quad" "agents" "$DEFAULT_SHELL"
+  else
+    local is_zoomed1
+    is_zoomed1=$(tmux display-message -t "$SESSION_NAME:1" -p "#{window_zoomed_flag}" 2>/dev/null || echo "0")
+    if [[ "$is_zoomed1" == "1" ]]; then
+      tmux resize-pane -t "$SESSION_NAME:1" -Z 2>/dev/null || true
+    fi
+
+    local pids1
+    pids1=($(tmux list-panes -t "$SESSION_NAME:1" -F "#{pane_id}" 2>/dev/null || true))
+    if [[ ${#pids1[@]} -lt 4 ]]; then
+      while [[ ${#pids1[@]} -lt 4 ]]; do
+        tmux split-window -t "$SESSION_NAME:1" -c "$DEFAULT_PROJ" "$DEFAULT_SHELL" 2>/dev/null || break
+        pids1=($(tmux list-panes -t "$SESSION_NAME:1" -F "#{pane_id}" 2>/dev/null || true))
+      done
+      tmux select-layout -t "$SESSION_NAME:1" tiled 2>/dev/null || true
+      tmux set-option -t "$SESSION_NAME:1" -w @swarm_layout "quad" 2>/dev/null || true
+    fi
+
+    for pid in $(tmux list-panes -t "$SESSION_NAME:1" -F "#{pane_id}"); do
+      tmux send-keys -t "$pid" C-u "clear" C-m
+      tmux clear-history -t "$pid" 2>/dev/null || true
+      tmux set-option -p -t "$pid" @agent_status "idle" 2>/dev/null || true
+      tmux set-option -p -t "$pid" @workmux_pane_status "idle" 2>/dev/null || true
+    done
+    local active_pids1
+    active_pids1=($(tmux list-panes -t "$SESSION_NAME:1" -F "#{pane_id}" 2>/dev/null || true))
+    tmux select-pane -t "${active_pids1[0]}" 2>/dev/null || true
+  fi
+
+  # Ensure Window 2 (editor) exists and reset in FISH
+  if ! tmux list-windows -t "$SESSION_NAME" -F "#{window_index}" | grep -q "^2$"; then
+    create_project_window "$DEFAULT_PROJ" "single" "editor" "$DEFAULT_SHELL"
+  else
+    local is_zoomed2
+    is_zoomed2=$(tmux display-message -t "$SESSION_NAME:2" -p "#{window_zoomed_flag}" 2>/dev/null || echo "0")
+    if [[ "$is_zoomed2" == "1" ]]; then
+      tmux resize-pane -t "$SESSION_NAME:2" -Z 2>/dev/null || true
+    fi
+    for pid in $(tmux list-panes -t "$SESSION_NAME:2" -F "#{pane_id}"); do
+      tmux send-keys -t "$pid" C-u "clear" C-m
+      tmux clear-history -t "$pid" 2>/dev/null || true
+    done
+    local active_pids2
+    active_pids2=($(tmux list-panes -t "$SESSION_NAME:2" -F "#{pane_id}" 2>/dev/null || true))
+    tmux select-pane -t "${active_pids2[0]}" 2>/dev/null || true
+  fi
+
+  sync_window_title
+  tmux refresh-client -S 2>/dev/null || true
+  tmux select-window -t "$SESSION_NAME:0" 2>/dev/null || true
+  echo "Swarm panes reset to clean default shells."
+  return 0
+}
+
+# Attach subcommand
+if [[ "${1:-}" == "attach" || "${1:-}" == "-a" ]]; then
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if [[ -n "${TMUX:-}" ]]; then
+      tmux switch-client -t "$SESSION_NAME"
+    else
+      exec tmux attach-session -t "$SESSION_NAME"
+    fi
+  else
+    echo "No active session '$SESSION_NAME' to attach to. Starting new session..."
+    shift || true
+  fi
+fi
+
+# Detach subcommand
+if [[ "${1:-}" == "detach" || "${1:-}" == "-d" ]]; then
+  tmux detach-client -s "$SESSION_NAME" 2>/dev/null && echo "Detached from swarm '$SESSION_NAME'." || echo "Not attached to '$SESSION_NAME'."
+  exit 0
+fi
+
+# Kill subcommand
+if [[ "${1:-}" == "kill" || "${1:-}" == "-k" ]]; then
+  sync_taskbar_badge 0
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    tmux kill-session -t "$SESSION_NAME"
+    echo "Killed swarm session '$SESSION_NAME'."
+  else
+    echo "Session '$SESSION_NAME' is not running."
+  fi
+  exit 0
+fi
+
+# Restart subcommand (rebuilds session from scratch)
+if [[ "${1:-}" == "restart" || "${1:-}" == "-r" ]]; then
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "Restarting swarm session '$SESSION_NAME' from scratch..."
+    tmux kill-session -t "$SESSION_NAME"
+    sleep 0.5
+  fi
+  shift || true
+fi
+
+# Clear subcommand (resets all panes to clean idle default shells without destroying session/windows)
+if [[ "${1:-}" == "clear" || "${1:-}" == "-clear" || "${1:-}" == "--clear" || "${1:-}" == "-c" ]]; then
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    clear_swarm_panes
+    if [[ -z "${TMUX:-}" ]]; then
+      exec tmux attach-session -t "$SESSION_NAME"
+    fi
+    exit 0
+  else
+    echo "No active session '$SESSION_NAME' to clear. Starting fresh swarm..."
+    shift || true
+  fi
+fi
+
+# Activity telemetry subcommands
+if [[ "${1:-}" == "idle-count" || "${1:-}" == "status-text" ]]; then
+  get_idle_shells_count
+  exit 0
+fi
+
+if [[ "${1:-}" == "writing-count" ]]; then
+  get_writing_count
+  exit 0
+fi
+
+if [[ "${1:-}" == "finished-count" ]]; then
+  get_finished_count
+  exit 0
+fi
+
+if [[ "${1:-}" == "window-title" || "${1:-}" == "title" ]]; then
+  get_window_title
+  exit 0
+fi
+
+# Model status bar subcommand: shows last dispatched AI model (for Ctrl+b m toggle)
+if [[ "${1:-}" == "active-model" ]]; then
+  curl -sm 3 http://127.0.0.1:4000/history 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    recent = d.get('recent_calls', d if isinstance(d, list) else [])
+    for call in (recent[-1:] if isinstance(recent, list) else []):
+        if isinstance(call, dict):
+            mdl = call.get('dispatched_model') or call.get('model') or '?'
+            tier = call.get('chosen_tier') or '?'
+            print(f'{mdl} ({tier})')
+            sys.exit(0)
+except Exception:
+    pass
+print('Pulling...')
+" 2>/dev/null || echo "Laya Offline"
+  exit 0
+fi
+
+# Finish-tracking toggle (Alt+f): scope for finished/working agent counters
+if [[ "${1:-}" == "toggle-scope" ]]; then
+  current_scope=$(tmux show-option -t "$SESSION_NAME" -v @swarm_finish_scope 2>/dev/null || echo "multi")
+  if [[ "$current_scope" == "multi" ]]; then
+    tmux set-option -t "$SESSION_NAME" @swarm_finish_scope "agents-only"
+    sync_window_title
+    tmux refresh-client -S 2>/dev/null || true
+    tmux display-message "Finish tracking: AGENTS WINDOW ONLY (Alt+f for all windows)"
+  else
+    tmux set-option -t "$SESSION_NAME" @swarm_finish_scope "multi"
+    sync_window_title
+    tmux refresh-client -S 2>/dev/null || true
+    tmux display-message "Finish tracking: ALL WINDOWS 1..N (Alt+f for agents only)"
+  fi
+  exit 0
+fi
+
+# Per-window tracking toggle (Alt+t): mark current window as tracked/untracked
+if [[ "${1:-}" == "toggle-window-tracked" ]]; then
+  current_win=$(tmux display-message -p '#{window_index}')
+  # Window 0 (telemetry) is never tracked
+  if [[ "$current_win" == "0" ]]; then
+    tmux display-message "Telemetry window (0) cannot be tracked"
+    exit 0
+  fi
+  current=$(tmux show-option -t "$SESSION_NAME:$current_win" -v @swarm_tracked 2>/dev/null || echo "on")
+  if [[ "$current" == "on" ]]; then
+    tmux set-option -t "$SESSION_NAME:$current_win" @swarm_tracked "off"
+    tmux display-message "Window $current_win: UNTRACKED (Alt+t to re-enable)"
+  else
+    tmux set-option -t "$SESSION_NAME:$current_win" @swarm_tracked "on"
+    tmux display-message "Window $current_win: TRACKED"
+  fi
+  sync_window_title
+  tmux refresh-client -S 2>/dev/null || true
+  exit 0
+fi
+
+if [[ "${1:-}" == "sync-title" ]]; then
+  sync_window_title
+  exit 0
+fi
+
+if [[ "${1:-}" == "sync-badge" || "${1:-}" == "badge" ]]; then
+  shift || true
+  if [[ -n "${1:-}" ]]; then
+    sync_taskbar_badge "$1"
+  else
+    sync_taskbar_badge "$(get_finished_count)"
+  fi
+  exit 0
+fi
+
+# Desktop notifications subcommand
+if [[ "${1:-}" == "notif" || "${1:-}" == "--notif" ]]; then
+  shift || true
+  action="${1:-toggle}"
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "Swarm session '$SESSION_NAME' is not active."
+    exit 1
+  fi
+  case "$action" in
+  on | enable)
+    tmux set -t "$SESSION_NAME" @swarm_notifs "on"
+    tmux display-message -t "$SESSION_NAME" "Desktop Notifications: ENABLED" 2>/dev/null || true
+    echo "Desktop notifications: ENABLED"
+    ;;
+  off | disable | mute)
+    tmux set -t "$SESSION_NAME" @swarm_notifs "off"
+    tmux display-message -t "$SESSION_NAME" "Desktop Notifications: MUTED" 2>/dev/null || true
+    echo "Desktop notifications: MUTED"
+    ;;
+  toggle | *)
+    cur=$(tmux display-message -t "$SESSION_NAME" -p "#{@swarm_notifs}" 2>/dev/null || echo "on")
+    if [[ "$cur" == "on" ]]; then
+      tmux set -t "$SESSION_NAME" @swarm_notifs "off"
+      tmux display-message -t "$SESSION_NAME" "Desktop Notifications: MUTED" 2>/dev/null || true
+      echo "Desktop notifications: MUTED"
+    else
+      tmux set -t "$SESSION_NAME" @swarm_notifs "on"
+      tmux display-message -t "$SESSION_NAME" "Desktop Notifications: ENABLED" 2>/dev/null || true
+      echo "Desktop notifications: ENABLED"
+    fi
+    ;;
+  esac
+  exit 0
+fi
+
+# Model overlay toggle subcommand
+if [[ "${1:-}" == "toggle-model" ]]; then
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "Swarm session '$SESSION_NAME' is not active."
+    exit 1
+  fi
+  cur_model_mode=$(tmux display-message -t "$SESSION_NAME" -p "#{@swarm_show_model}" 2>/dev/null || echo "off")
+  if [[ "$cur_model_mode" == "on" ]]; then
+    tmux set -t "$SESSION_NAME" @swarm_show_model "off"
+    tmux display-message -t "$SESSION_NAME" "Model Status Bar: OFF" 2>/dev/null || true
+  else
+    tmux set -t "$SESSION_NAME" @swarm_show_model "on"
+    tmux display-message -t "$SESSION_NAME" "Model Status Bar: ON" 2>/dev/null || true
+  fi
+  tmux refresh-client -S 2>/dev/null || true
+  exit 0
+fi
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  show_help
+  exit 0
+fi
+
+if [[ "${1:-}" == "keys" ]]; then
+  show_keys
+  exit 0
+fi
+
+if [[ "${1:-}" == "restart-window" || "${1:-}" == "rw" ]]; then
+  win="${2:-}"
+  [[ -z "$win" ]] && { echo "Usage: agent-swarm restart-window <0|1|2|agents|editor|telemetry|N>"; exit 1; }
+
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    # Allow overriding the target session for testing: SESSION_NAME=... agent-swarm rw 2
+    echo "Swarm session '$SESSION_NAME' is not active." >&2
+    exit 1
+  fi
+  # Resolve name -> index
+  case "$win" in
+  telemetry) win=0 ;;
+  agents | agent | ai) win=1 ;;
+  editor | edit | nvim) win=2 ;;
+  *)
+    idx=$(tmux list-windows -t "$SESSION_NAME" -F "#{window_index}:#{window_name}" |
+      awk -F: -v w="$win" '$2==w{print $1; exit}')
+    [[ -n "$idx" ]] && win="$idx"
+    ;;
+  esac
+
+  if ! tmux list-windows -t "$SESSION_NAME" -F "#{window_index}" | grep -qx -- "$win"; then
+    echo "No window '$win' in swarm '$SESSION_NAME'." >&2
+    exit 1
+  fi
+
+  if [[ "$win" == "0" ]]; then
+    echo "Window 0 is the telemetry cockpit; rebuild the whole swarm with 'rdr -r'." >&2
+    exit 1
+  fi
+
+  target_dir=$(tmux display-message -t "$SESSION_NAME:$win" -p "#{pane_current_path}")
+  [[ -d "$target_dir" ]] || target_dir="$HOME"
+  shell_bin="$DEFAULT_SHELL"
+  [[ "$win" == "1" ]] && shell_bin="$AGENT_SHELL"
+
+  # Close extra panes, respawn the survivor in place (fresh shell + clean scrollback)
+  mapfile -t panes < <(tmux list-panes -t "$SESSION_NAME:$win" -F "#{pane_index}")
+  for ((i = ${#panes[@]} - 1; i >= 1; i--)); do
+    tmux kill-pane -t "$SESSION_NAME:$win.${panes[$i]}" 2>/dev/null || true
+  done
+  tmux resize-pane -t "$SESSION_NAME:$win.0" -Z 2>/dev/null || true
+  tmux respawn-pane -k -t "$SESSION_NAME:$win.0" -c "$target_dir" "$shell_bin"
+  tmux clear-history -t "$SESSION_NAME:$win.0" 2>/dev/null || true
+  tmux select-window -t "$SESSION_NAME:$win"
+
+  # Window 1 gets its 4-pane agent grid back
+  if [[ "$win" == "1" ]]; then
+    tmux select-pane -t "$SESSION_NAME:1.0"
+    (
+      export AGENT_SWARM_AGENT_SHELL="$AGENT_SHELL"
+      apply_layout quad
+    ) >/dev/null 2>&1 || true
+  fi
+
+  sync_window_title 2>/dev/null || true
+  tmux refresh-client -S 2>/dev/null || true
+  echo "Window $win restarted in $target_dir."
+  exit 0
+fi
+
+if [[ "${1:-}" == "help" ]]; then
+  if [[ -n "${TMUX:-}" && -n "$(tmux display-message -p '#{client_name}' 2>/dev/null)" ]]; then
+    # Inside a client: open the cheat sheet in a tmux popup (any key closes it)
+    tmux display-popup -E -w 90% -h 90% -T " agent-swarm keys " "$KEYS_VIEWER"
+  else
+    show_keys
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "layout" ]]; then
+  shift
+  apply_layout "${1:-single}"
+  exit 0
+fi
+
+# Dynamic 'add' subcommand
+if [[ "${1:-}" == "add" ]]; then
+  shift
+  target="${1:-$PWD}"
+  req_layout="${2:-$DEFAULT_LAYOUT}"
+  if [[ ! -d "$target" ]]; then
+    echo "Error: Directory not found: $target"
+    exit 1
+  fi
+  target="$(cd "$target" && pwd)"
+
+  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "Swarm session not active. Launching new session with: $target"
+    exec "$0" "$target"
+  fi
+
+  create_project_window "$target" "$req_layout"
+  echo "Added '$target' as a new window in '$SESSION_NAME' (layout: $req_layout)."
+  exit 0
+fi
+
+# Parse CLI options
+RUN_IN_CURRENT_TERM=false
+CLEAR_SESSION=false
+TERM_APP="$DEFAULT_TERM"
+WIN_MODE="$DEFAULT_MODE"
+LAYOUT_PRESET="$DEFAULT_LAYOUT"
+LAYOUT_EXPLICIT=false
+REMAINING_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --clear | -clear | -c | clear)
+    CLEAR_SESSION=true
+    shift
+    ;;
+  -t | --terminal)
+    RUN_IN_CURRENT_TERM=true
+    shift
+    ;;
+  -g | --gui)
+    RUN_IN_CURRENT_TERM=false
+    shift
+    ;;
+  --alacritty)
+    TERM_APP="alacritty"
+    shift
+    ;;
+  --konsole)
+    TERM_APP="konsole"
+    shift
+    ;;
+  --maximized)
+    WIN_MODE="maximized"
+    shift
+    ;;
+  --fullscreen)
+    WIN_MODE="fullscreen"
+    shift
+    ;;
+  --floating)
+    WIN_MODE="floating"
+    shift
+    ;;
+  --single | -1)
+    LAYOUT_PRESET="single"
+    LAYOUT_EXPLICIT=true
+    shift
+    ;;
+  --dual | -2)
+    LAYOUT_PRESET="dual"
+    LAYOUT_EXPLICIT=true
+    shift
+    ;;
+  --tri | -3)
+    LAYOUT_PRESET="tri"
+    LAYOUT_EXPLICIT=true
+    shift
+    ;;
+  --quad | -4)
+    LAYOUT_PRESET="quad"
+    LAYOUT_EXPLICIT=true
+    shift
+    ;;
+  -l | --layout)
+    LAYOUT_PRESET="$2"
+    LAYOUT_EXPLICIT=true
+    shift 2
+    ;;
+  *)
+    REMAINING_ARGS+=("$1")
+    shift
+    ;;
+  esac
+done
+
+# Verify dependencies before spawning any GUI window.
+preflight_check "$TERM_APP"
+
+# If not running in terminal mode and not already inside launched terminal, spawn wrapper
+if [[ "$RUN_IN_CURRENT_TERM" == "false" && -z "${AGENT_SWARM_IN_TERM:-}" ]]; then
+  extra_flags=()
+  win_title="Agent Swarm (rdr)"
+  win_class="agent-swarm,agent-swarm"
+
+  if [[ "$CLEAR_SESSION" == "true" ]]; then
+    extra_flags+=("--clear")
+  fi
+  if [[ "$LAYOUT_EXPLICIT" == "true" ]]; then
+    extra_flags+=("--layout" "$LAYOUT_PRESET")
+  fi
+  case "$TERM_APP" in
+  konsole)
+    if [[ "$WIN_MODE" == "fullscreen" ]]; then
+      exec env AGENT_SWARM_IN_TERM=1 konsole --fullscreen -p TerminalMargin=0 --hide-menubar --hide-tabbar -e "$0" -t "${extra_flags[@]}" "${REMAINING_ARGS[@]}"
+    else
+      exec env AGENT_SWARM_IN_TERM=1 konsole -p TerminalMargin=0 --hide-menubar --hide-tabbar --qwindowgeometry 2500x1400 -e "$0" -t "${extra_flags[@]}" "${REMAINING_ARGS[@]}"
+    fi
+    ;;
+  alacritty | *)
+    startup_opt="Maximized"
+    if [[ "$WIN_MODE" == "fullscreen" ]]; then
+      startup_opt="Fullscreen"
+    elif [[ "$WIN_MODE" == "floating" ]]; then
+      startup_opt="Windowed"
+    fi
+    exec env AGENT_SWARM_IN_TERM=1 alacritty -o "window.startup_mode=\"$startup_opt\"" -o "window.dynamic_title=true" --class "$win_class" -e "$0" -t "${extra_flags[@]}" "${REMAINING_ARGS[@]}"
+    ;;
+  esac
+fi
+
+# Determine project directories for session
+PROJECTS=()
+if [[ ${#REMAINING_ARGS[@]} -eq 0 ]]; then
+  PROJECTS+=("$DEFAULT_PROJ")
+else
+  for arg in "${REMAINING_ARGS[@]}"; do
+    if [[ -d "$arg" ]]; then
+      PROJECTS+=("$(cd "$arg" && pwd)")
+    else
+      echo "Warning: Directory not found: $arg"
+    fi
+  done
+fi
+
+if [[ ${#PROJECTS[@]} -eq 0 ]]; then
+  PROJECTS+=("$DEFAULT_PROJ")
+fi
+
+# TMUX Backend: If clear requested, reset all panes to clean default shells
+if [[ "$CLEAR_SESSION" == "true" ]] && tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  clear_swarm_panes
+  echo "Swarm session '$SESSION_NAME' reset. Attaching..."
+  exec tmux attach-session -t "$SESSION_NAME"
+fi
+
+# TMUX Backend: If session already exists, attach or add projects
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  # Self-heal missing Window 0, Window 1 or Window 2 if accidentally closed
+  if ! tmux list-windows -t "$SESSION_NAME" -F "#{window_index}" | grep -q "^0$"; then
+    setup_telemetry_window
+  fi
+  if ! tmux list-windows -t "$SESSION_NAME" -F "#{window_index}" | grep -q "^1$"; then
+    create_project_window "$DEFAULT_PROJ" "quad" "agents" "$AGENT_SHELL"
+  fi
+  if ! tmux list-windows -t "$SESSION_NAME" -F "#{window_index}" | grep -q "^2$"; then
+    create_project_window "$DEFAULT_PROJ" "single" "editor" "$DEFAULT_SHELL"
+  fi
+  if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
+    for arg in "${REMAINING_ARGS[@]}"; do
+      if [[ -d "$arg" ]]; then
+        create_project_window "$(cd "$arg" && pwd)" "$LAYOUT_PRESET"
+      fi
+    done
+  fi
+  tmux select-window -t "$SESSION_NAME:0" 2>/dev/null || true
+  echo "Session '$SESSION_NAME' is active. Attaching..."
+  exec tmux attach-session -t "$SESSION_NAME"
+fi
+
+# Start detached tmux session with Window 0: Telemetry
+tmux new-session -d -s "$SESSION_NAME" -x 240 -y 65 -n "telemetry" -c "$HOME" "$DEFAULT_SHELL"
+tmux set-option -t "$SESSION_NAME" default-shell "$DEFAULT_SHELL"
+tmux set-option -t "$SESSION_NAME" window-size latest
+
+# Configure session ergonomics
+tmux set-option -t "$SESSION_NAME" mouse on
+tmux set-option -t "$SESSION_NAME" base-index 0
+tmux set-window-option -t "$SESSION_NAME" pane-base-index 0
+
+# Desktop notifications (disabled by default)
+tmux set-option -t "$SESSION_NAME" @swarm_show_model "off"
+tmux set-option -t "$SESSION_NAME" monitor-bell off
+
+# Styling: Nordic dark palette matching Alacritty
+tmux set-option -t "$SESSION_NAME" status-style "bg=#2E3440,fg=#D8DEE9"
+tmux set-option -t "$SESSION_NAME" status-left-length 40
+tmux set-option -t "$SESSION_NAME" status-right-length 150
+tmux set-option -t "$SESSION_NAME" status-left "#[bold,fg=#88C0D0][Agent Swarm] #[default]"
+tmux set-option -t "$SESSION_NAME" status-right "#(curl -s http://127.0.0.1:4000/health >/dev/null && echo '#[fg=#A3BE8C]● Laya Online#[default]' || echo '#[fg=#BF616A]○ Laya Offline#[default]')#{?#{==:#{@swarm_show_model},on}, | #[fg=#EBCB8B]#(agent-swarm active-model)#[default],} | #{?#{==:#{@swarm_notifs},on},#[fg=#A3BE8C]Notif:ON#[default],#[fg=#6C7A96]Notif:OFF#[default]} | #(agent-swarm idle-count) | #[fg=#81A1C1]Ctrl+b h:Help | Alt+l:Layout | Alt+z:Zoom#[default] "
+tmux set-option -t "$SESSION_NAME" status-interval 2
+tmux set-option -t "$SESSION_NAME" status-position bottom
+
+# Dynamic window title integration (KDE Task Manager / Panel)
+tmux set-option -t "$SESSION_NAME" set-titles on
+tmux set-option -g set-titles on
+tmux set-option -as terminal-overrides ",xterm*:XT,alacritty*:XT"
+tmux set-option -t "$SESSION_NAME" set-titles-string "#(agent-swarm window-title)"
+tmux set-option -g set-titles-string "#(agent-swarm window-title)"
+
+# Window status tabs:
+# Inactive window: subtle grey/blue
+tmux set-window-option -t "$SESSION_NAME" window-status-format " #I:#W "
+# Active window: highlighted green/frost
+tmux set-window-option -t "$SESSION_NAME" window-status-current-style "bold,bg=#4C566A,fg=#ECEFF4"
+tmux set-window-option -t "$SESSION_NAME" window-status-current-format " #[fg=#A3BE8C]#I:#W#[default] "
+
+# Single-key window switching (Alt + number)
+for i in {0..9}; do
+  tmux bind-key -n "M-$i" select-window -t "$i"
+done
+
+# Directional navigation: Shift+Arrows
+tmux bind-key -n S-Left if-shell -F "#{||:#{pane_at_left},#{window_zoomed_flag}}" "previous-window" "select-pane -L"
+tmux bind-key -n S-Right if-shell -F "#{||:#{pane_at_right},#{window_zoomed_flag}}" "next-window" "select-pane -R"
+tmux bind-key -n S-Up if-shell -F "#{window_zoomed_flag}" "" "select-pane -U"
+tmux bind-key -n S-Down if-shell -F "#{window_zoomed_flag}" "" "select-pane -D"
+
+# Pane cycling shortcut (Alt + `)
+tmux bind-key -n "M-\`" select-pane -t :.+
+
+# Layout & Zoom controls:
+# Alt+z: Toggle full-screen zoom on active pane
+tmux bind-key -n M-z resize-pane -Z
+
+# Alt+l: Cycle layout (Single -> Dual -> Tri -> Quad -> Single)
+tmux bind-key -n M-l run-shell "agent-swarm layout cycle"
+
+# Alt+= and Alt+r: Reset/equalize pane dimensions (fixes accidental mouse deformation)
+tmux bind-key -n M-= run-shell "agent-swarm layout reset"
+tmux bind-key -n M-r run-shell "agent-swarm layout reset"
+tmux bind-key "&" confirm-before -p "Close window #I (#{window_name})? (y/n)" kill-window
+
+# Intuitive pane splits (standard tmux % and ", plus | and -) preserving current directory:
+tmux bind-key % split-window -h -c "#{pane_current_path}"
+tmux bind-key '"' split-window -v -c "#{pane_current_path}"
+tmux bind-key '|' split-window -h -c "#{pane_current_path}"
+tmux bind-key - split-window -v -c "#{pane_current_path}"
+
+# Advanced commands under Ctrl+b prefix:
+# Ctrl+b d = detach (tmux stock default, intentionally left untouched)
+# Ctrl+b x = close pane (tmux stock default, intentionally left untouched)
+tmux bind-key a command-prompt -p "Add project folder to swarm:" "run-shell 'agent-swarm add \"%%%\"'"
+tmux bind-key f run-shell "agent-swarm toggle-scope"
+tmux bind-key -n M-t run-shell "agent-swarm toggle-window-tracked"
+tmux bind-key n if-shell -F "#{==:#{@swarm_notifs},on}" \
+  "set -t $SESSION_NAME @swarm_notifs off ; refresh-client -S ; display-message 'Desktop Notifications: OFF (Press Ctrl+b n to enable)'" \
+  "set -t $SESSION_NAME @swarm_notifs on ; refresh-client -S ; display-message 'Desktop Notifications: ON (Press Ctrl+b n to mute)'"
+# Prefix+m: toggle Active AI Model readout in the status bar
+tmux bind-key m if-shell -F "#{==:#{@swarm_show_model},on}" \
+  "set -t $SESSION_NAME @swarm_show_model off ; refresh-client -S ; display-message 'Active Model Status Bar: OFF'" \
+  "set -t $SESSION_NAME @swarm_show_model on ; refresh-client -S ; display-message 'Active Model Status Bar: ON'"
+# Prefix+h: cheat sheet popup (dismiss with any key)
+tmux bind-key h display-popup -E -w 90% -h 90% -T " agent-swarm keys " "$KEYS_VIEWER"
+
+# Setup Window 0: 5-pane Laya Telemetry Cockpit
+setup_telemetry_window
+
+# Setup Initial Windows:
+# Window 1: 'agents' - 4-shell quad grid in FISH for parallel AI coding agents
+# Window 2: 'editor' - clean single-pane shell in FISH for nvim or user commands
+PRIMARY_DIR="${PROJECTS[0]}"
+AGENTS_LAYOUT="quad"
+if [[ "$LAYOUT_EXPLICIT" == "true" ]]; then
+  AGENTS_LAYOUT="$LAYOUT_PRESET"
+fi
+
+create_project_window "$PRIMARY_DIR" "$AGENTS_LAYOUT" "agents" "$AGENT_SHELL"
+create_project_window "$PRIMARY_DIR" "single" "editor" "$DEFAULT_SHELL"
+
+# Setup any additional project windows requested (Window 3..N)
+if [[ ${#PROJECTS[@]} -gt 1 ]]; then
+  for proj in "${PROJECTS[@]:1}"; do
+    create_project_window "$proj" "$LAYOUT_PRESET" "" "$DEFAULT_SHELL"
+  done
+fi
+
+# Focus Window 0 (telemetry) and attach
+tmux select-window -t "$SESSION_NAME:0"
+exec tmux attach-session -t "$SESSION_NAME"

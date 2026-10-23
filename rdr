@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# rdr: Keyboard-first agent workspace (the opposite of herdr)
+# Direct launcher for agent-swarm
+# ==============================================================================
+exec "$(dirname "$0")/agent-swarm" "$@"
