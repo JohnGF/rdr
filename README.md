@@ -1,12 +1,17 @@
-# rdr
+# agent-swarm
 
-## Keyboard-First Agent Workspace
+## Keyboard-First Agent Workspace (tmux edition)
 
-`rdr` is a zero-bloat, keyboard-first terminal workspace designed for running, monitoring, and multiplexing AI coding agents across independent projects with real-time Writing/Sleeping telemetry in the status footer.
+> **Looking for `rdr`?** This project used to be called `rdr`. That name, and the
+> command `rdr`, now belong to its Rust successor **[rdreh](https://github.com/JohnGF/rdreh)**:
+> a single binary with its own multiplexer, persistent sessions and token telemetry.
+> agent-swarm continues here as the tmux edition, for people who prefer tmux.
 
-![rdr screenshot preview](./docs/screenshots/cockpit.png)
+`agent-swarm` is a zero-bloat, keyboard-first terminal workspace designed for running, monitoring, and multiplexing AI coding agents across independent projects with real-time Writing/Sleeping telemetry in the status footer.
 
-## What makes rdr special?
+![agent-swarm screenshot preview](./docs/screenshots/cockpit.png)
+
+## What makes agent-swarm special?
 
 - **One terminal session** hosts multiple AI agents (agy, claude, opencode, aider) in a tmux layout
 - **Real-time telemetry** in status footer: Writing/Sleeping counts, session duration, tool usage
@@ -30,8 +35,8 @@
   - `Ctrl+b c`: new terminal tab
   - `Ctrl+b &`: close window
   - `Ctrl+b w`: window list
-  - `rdr -c`: clear all panes (non-destructive)
-  - `rdr -r`: rebuild full layout from template
+  - `agent-swarm -c`: clear all panes (non-destructive)
+  - `agent-swarm -r`: rebuild full layout from template
 
 - **Terminal-agnostic**: auto-detects alacritty, kitty, foot, xterm, konsole, gnome-terminal
 - **Customizable layouts**: preset layouts (single, dual, tri, quad) with layout commands
@@ -41,21 +46,21 @@
 
 1. Install tmux and your preferred terminal (alacritty, kitty, etc.)
 2. Clone this repo
-3. Symlink `rdr` into your PATH:
+3. Symlink `agent-swarm` into your PATH:
    ```bash
-   ln -s $PWD/rdr ~/.local/bin/rdr
+   ln -s $PWD/agent-swarm ~/.local/bin/agent-swarm
    ```
-4. Run: `rdr`
+4. Run: `agent-swarm`
 
 ## Usage
 
 ```bash
-rdr              # launch with default quad layout
-rdr -l quad      # launch with quad layout
-rdr -l telemetry # launch with telemetry layout
-rdr -c           # clear all panes
-rdr -r           # rebuild full layout
-rdr -k           # kill session
+agent-swarm              # launch with default quad layout
+agent-swarm -l quad      # launch with quad layout
+agent-swarm -l telemetry # launch with telemetry layout
+agent-swarm -c           # clear all panes
+agent-swarm -r           # rebuild full layout
+agent-swarm -k           # kill session
 ```
 
 ## Layouts
@@ -79,7 +84,7 @@ rdr -k           # kill session
 
 ## Optional Integration with Laya
 
-`rdr` can optionally integrate with the `laya` secret gateway for proxy health checks (`laya-tool-tracker`, `laya-stats --routing`, `laya-stats --audit`). This is NOT required — `rdr` runs standalone with any agent that has a CLI.
+`agent-swarm` can optionally integrate with the `laya` secret gateway for proxy health checks (`laya-tool-tracker`, `laya-stats --routing`, `laya-stats --audit`). This is NOT required — `agent-swarm` runs standalone with any agent that has a CLI.
 
 ## License
 
